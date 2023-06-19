@@ -7,7 +7,9 @@ gpu_id: 1
 seed: 42
 
 search_for_threshold: False
-threshold: 0.8
+image_threshold: 0.8
+text_threshold: 0.4
+concatenated_threshold: 0.8
 topk: 50
 
 dataset:

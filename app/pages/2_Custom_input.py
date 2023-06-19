@@ -3,27 +3,34 @@ import argparse
 import os
 import sys
 
+import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+import transformers
 import yaml
-from dataset import ShopeeImageDataset, ShopeeTextDataset
-from models.image_model import ShopeeImageModel
-from models.text_model import ShopeeTextModel
 from PIL import Image
 from sklearn.preprocessing import LabelEncoder
-from transformers import AutoTokenizer
-from transforms import get_valid_transforms
-from utils.eval_utils import (generate_image_features, generate_text_features,
-                              get_concatenated_predictions, plot_threshold)
-from utils.utils import convert_dict_to_tuple, set_seed
+
+from app.dataset import ShopeeImageDataset, ShopeeTextDataset
+from app.models.image_model import ShopeeImageModel
+from app.models.text_model import ShopeeTextModel
+from app.transforms import get_valid_transforms
+from app.utils.eval_utils import (generate_image_embedding,
+                                  generate_image_features,
+                                  generate_text_embedding,
+                                  generate_text_features,
+                                  get_custom_concatenated_predictions,
+                                  get_custom_image_predictions,
+                                  get_custom_text_predictions)
+from app.utils.utils import convert_dict_to_tuple, set_seed
 
 
 @st.cache_resource
 def load_tokenizer(config):
     print("Setting up the tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(config.text_model.model_name)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(config.text_model.model_name)
     return tokenizer
 
 
@@ -150,17 +157,14 @@ def concatenate_features(image_features, text_features):
     return concatenated_features_normalized
 
 
-@st.cache_data
-def get_matches(valid, concatenated_features, config):
-    f1_score, output_df = get_concatenated_predictions(
-        valid, concatenated_features, threshold=config.threshold
-    )
-    return output_df
-
-
 def main(args: argparse.Namespace):
-    st.title("Welcome to the Afa shop!")
-    "Select the item from the Shopee set or upload your own data"
+    st.title(
+        "Type in the description and upload the image of the item that you would like to find"
+    )
+
+    input_image = st.sidebar.file_uploader("Upload an image of the desired item")
+    input_text = st.sidebar.text_input("Type in the description of the desired item")
+
     with open(args.cfg) as f:
         data = yaml.safe_load(f)
 
@@ -199,37 +203,106 @@ def main(args: argparse.Namespace):
 
     print("Concatenated features shape: ", concatenated_features.shape)
 
-    output_df = get_matches(valid, concatenated_features, config)
+    # Process input image
+    if input_image is not None:
+        "Input query image"
+        file_bytes = np.asarray(bytearray(input_image.read()), dtype=np.uint8)
+        image = cv2.imdecode(file_bytes, 1)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        st.image(image, caption="Desired item")
 
-    # output_df
+        augmented = get_valid_transforms(config)(image=image)
+        tensor_image = augmented["image"]
+        tensor_image = tensor_image.unsqueeze(0)
 
-    # output_df.to_csv('output_df.csv')
+        image_embedding = generate_image_embedding(image_model, tensor_image, device)
 
-    # Test
-    # width = st.sidebar.slider('Image width?', 1, 1000, 100)
+        # Only image
+        if not input_text:
+            image_predictions = get_custom_image_predictions(
+                image_embedding, image_features
+            )
+            "Best predictions for input image: "
+            print("Image predictions: ", image_predictions)
+            if image_predictions[0].any():
+                for idx, result_idx in enumerate(image_predictions[0]):
+                    path_to_image = valid.iloc[result_idx]["filepath"]
+                    image_to_show = Image.open(path_to_image)
+                    st.image(
+                        image_to_show,
+                        caption=valid.iloc[result_idx]["title"],
+                    )
+        else:
+            print(input_text)
+            input_text_tokenized = tokenizer(
+                input_text,
+                padding="max_length",
+                truncation=True,
+                max_length=64,
+                return_tensors="pt",
+            )
+            input_ids = input_text_tokenized["input_ids"][0]
+            attention_mask = input_text_tokenized["attention_mask"][0]
 
-    # Read input image
-    option = st.sidebar.selectbox(
-        "Select the index of the item: ", np.arange(valid.shape[0])
-    )
-    print(option)
-    "Input image"
-    path_to_input = output_df.iloc[int(option)]["filepath"]
-    input_image = Image.open(path_to_input)
-    st.image(input_image, caption=output_df.iloc[int(option)]["title"])
+            input_ids = input_ids.unsqueeze(0)
+            attention_mask = attention_mask.unsqueeze(0)
 
-    # Show results
-    results = output_df.iloc[int(option)]["pred_concat"]
-    "Best matches: "
-    for idx, result in enumerate(results):
-        path_to_image = output_df.loc[
-            output_df["posting_id"] == result, "filepath"
-        ].iloc[0]
-        image_to_show = Image.open(path_to_image)
-        st.image(
-            image_to_show,
-            caption=output_df.loc[output_df["posting_id"] == result, "title"].iloc[0],
+            text_embedding = generate_text_embedding(
+                text_model, input_ids, attention_mask, device
+            )
+            concatenated_embedding = np.concatenate(
+                [image_embedding, text_embedding], axis=1
+            )
+            norm = np.linalg.norm(concatenated_embedding, axis=1)
+            concatenated_embedding_normalized = concatenated_embedding / norm
+            concatenated_predictions = get_custom_concatenated_predictions(
+                concatenated_embedding_normalized, concatenated_features
+            )
+            "Best multimodal predictions: "
+            print("Multimodal predictions: ", concatenated_predictions)
+            if concatenated_predictions[0].any():
+                for idx, result_idx in enumerate(concatenated_predictions[0]):
+                    path_to_image = valid.iloc[result_idx]["filepath"]
+                    image_to_show = Image.open(path_to_image)
+                    st.image(
+                        image_to_show,
+                        caption=valid.iloc[result_idx]["title"],
+                    )
+
+    # Process input text
+    if input_text:
+        print(input_text)
+        f"Input text: {input_text}"
+        input_text_tokenized = tokenizer(
+            input_text,
+            padding="max_length",
+            truncation=True,
+            max_length=64,
+            return_tensors="pt",
         )
+        input_ids = input_text_tokenized["input_ids"][0]
+        attention_mask = input_text_tokenized["attention_mask"][0]
+
+        input_ids = input_ids.unsqueeze(0)
+        attention_mask = attention_mask.unsqueeze(0)
+
+        text_embedding = generate_text_embedding(
+            text_model, input_ids, attention_mask, device
+        )
+
+        if input_image is None:
+            text_predictions = get_custom_text_predictions(
+                text_embedding, text_features
+            )
+            "Best predictions for input text: "
+            if text_predictions[0].any():
+                for idx, result_idx in enumerate(text_predictions[0]):
+                    path_to_image = valid.iloc[result_idx]["filepath"]
+                    image_to_show = Image.open(path_to_image)
+                    st.image(
+                        image_to_show,
+                        caption=valid.iloc[result_idx]["title"],
+                    )
 
 
 def parse_arguments(argv):
