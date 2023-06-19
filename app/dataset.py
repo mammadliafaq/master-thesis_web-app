@@ -17,8 +17,6 @@ class ShopeeImageDataset(Dataset):
     def __getitem__(self, index):
         row = self.csv.iloc[index]
 
-        text = row.title
-
         image = cv2.imread(row.filepath)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
